@@ -353,53 +353,81 @@ def get_vin_roi_from_line(line, img_shape):
 
 
 def remove_vin_from_image(img, lines):
+
     draw_img = img.copy()
 
     vin_line = find_vin_line(lines)
 
     if vin_line is None:
-        print("VIN line not found")
         return draw_img
 
-    x1, y1, x2, y2 = get_vin_roi_from_line(vin_line, draw_img.shape)
+    char_boxes = get_vin_char_boxes(vin_line)
 
-    roi = draw_img[y1:y2, x1:x2].copy()
-
-    if roi.size == 0:
-        return draw_img
-
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-
-    mask1 = cv2.inRange(gray, 145, 255)
-
-    _, mask2 = cv2.threshold(
-        gray,
-        0,
-        255,
-        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    mask = np.zeros(
+        draw_img.shape[:2],
+        dtype=np.uint8
     )
 
-    mask = cv2.bitwise_or(mask1, mask2)
+    for x1,y1,x2,y2 in char_boxes:
 
-    kernel_small = np.ones((2, 2), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
+        cv2.rectangle(
+            mask,
+            (x1-2,y1-2),
+            (x2+2,y2+2),
+            255,
+            -1
+        )
 
-    kernel_big = np.ones((5, 5), np.uint8)
-    mask = cv2.dilate(mask, kernel_big, iterations=2)
+    mask = cv2.GaussianBlur(mask,(5,5),0)
 
-    clean_roi = cv2.inpaint(roi, mask, 5, cv2.INPAINT_TELEA)
+    result = cv2.inpaint(
+        draw_img,
+        mask,
+        3,
+        cv2.INPAINT_TELEA
+    )
 
-    blur_roi = cv2.GaussianBlur(clean_roi, (3, 3), 0)
+    return result
 
-    alpha = mask.astype(np.float32) / 255.0
-    alpha = cv2.GaussianBlur(alpha, (7, 7), 0)
-    alpha = alpha[:, :, None]
 
-    result_roi = (blur_roi * alpha + roi * (1 - alpha)).astype(np.uint8)
+def get_vin_char_boxes(vin_line):
+    text = normalize_text(vin_line["text"])
 
-    draw_img[y1:y2, x1:x2] = result_roi
+    m = re.search(VIN_REGEX, text)
 
-    return draw_img
+    if not m:
+        return []
+
+    vin = m.group(0)
+
+    start_idx = m.start()
+    end_idx = m.end()
+
+    x1 = vin_line["x1"]
+    x2 = vin_line["x2"]
+    y1 = vin_line["y1"]
+    y2 = vin_line["y2"]
+
+    total_chars = len(text)
+
+    char_w = (x2 - x1) / total_chars
+
+    boxes = []
+
+    for i in range(start_idx, end_idx):
+        cx1 = int(x1 + i * char_w)
+        cx2 = int(x1 + (i + 1) * char_w)
+
+        boxes.append(
+            (
+                cx1,
+                y1,
+                cx2,
+                y2
+            )
+        )
+
+    return boxes
 
 
 def process_image(image_path):
