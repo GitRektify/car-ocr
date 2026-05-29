@@ -310,15 +310,10 @@ def find_vin_line(lines):
 
             if "VIN" in t:
                 score += 100
-
             if "车辆识别代号" in t:
                 score += 100
-
-            if line["x1"] < 400:
-                score += 20
-
-            if line["x1"] > 450 and line["cy"] < 250:
-                score -= 80
+            if line["x1"] < 450:
+                score += 30
 
             candidates.append((score, line))
 
@@ -327,6 +322,124 @@ def find_vin_line(lines):
 
     candidates.sort(key=lambda x: x[0], reverse=True)
     return candidates[0][1]
+
+
+def estimate_vin_roi_by_projection(img, vin_line):
+    """
+    Find actual VIN print area using vertical white-pixel projection.
+    This avoids Chinese character width bug.
+    """
+
+    x1, y1, x2, y2 = vin_line["x1"], vin_line["y1"], vin_line["x2"], vin_line["y2"]
+
+    pad_x = 20
+    pad_y = 8
+
+    h_img, w_img = img.shape[:2]
+
+    x1 = max(0, x1 - pad_x)
+    y1 = max(0, y1 - pad_y)
+    x2 = min(w_img, x2 + pad_x)
+    y2 = min(h_img, y2 + pad_y)
+
+    roi = img[y1:y2, x1:x2].copy()
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    # VIN is bright/white
+    mask = cv2.inRange(gray, 135, 255)
+
+    # clean noise
+    kernel = np.ones((2, 2), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # vertical projection
+    col_sum = np.sum(mask > 0, axis=0)
+
+    threshold = max(2, int(mask.shape[0] * 0.12))
+    active_cols = np.where(col_sum > threshold)[0]
+
+    if len(active_cols) == 0:
+        return x1, y1, x2, y2
+
+    # group continuous active columns
+    groups = []
+    start = active_cols[0]
+    prev = active_cols[0]
+
+    for c in active_cols[1:]:
+        if c - prev > 6:
+            groups.append((start, prev))
+            start = c
+        prev = c
+
+    groups.append((start, prev))
+
+    # keep groups likely belonging to VIN, not Chinese label
+    valid_groups = []
+
+    for gx1, gx2 in groups:
+        gw = gx2 - gx1
+
+        # VIN string is long, label groups are shorter or left side
+        if gw > roi.shape[1] * 0.25:
+            valid_groups.append((gx1, gx2))
+
+    if not valid_groups:
+        # fallback: use right side after detected label area
+        vx1 = int(roi.shape[1] * 0.28)
+        vx2 = roi.shape[1]
+    else:
+        vx1 = min(g[0] for g in valid_groups)
+        vx2 = max(g[1] for g in valid_groups)
+
+    return x1 + vx1, y1, x1 + vx2, y2
+
+
+def build_vin_print_mask(img, vin_roi):
+    """
+    Builds mask only for printed VIN strokes, not whole region.
+    """
+
+    x1, y1, x2, y2 = vin_roi
+
+    roi = img[y1:y2, x1:x2].copy()
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+    # white VIN strokes
+    mask = cv2.inRange(gray, 145, 255)
+
+    # remove tiny speckles
+    kernel_open = np.ones((2, 2), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+
+    clean_mask = np.zeros_like(mask)
+
+    h, w = mask.shape[:2]
+
+    for i in range(1, num_labels):
+        x, y, bw, bh, area = stats[i]
+
+        if area < 8:
+            continue
+
+        # VIN characters are tall enough
+        if bh < h * 0.25:
+            continue
+
+        # ignore very wide objects, likely glare/line
+        if bw > w * 0.18:
+            continue
+
+        # keep character-like blobs
+        clean_mask[labels == i] = 255
+
+    # expand only print strokes, not full char box
+    kernel_dilate = np.ones((3, 3), np.uint8)
+    clean_mask = cv2.dilate(clean_mask, kernel_dilate, iterations=2)
+
+    return clean_mask
 
 
 def get_vin_roi_from_line(line, img_shape):
@@ -353,39 +466,28 @@ def get_vin_roi_from_line(line, img_shape):
 
 
 def remove_vin_from_image(img, lines):
-
     draw_img = img.copy()
 
     vin_line = find_vin_line(lines)
 
     if vin_line is None:
+        print("VIN line not found")
         return draw_img
 
-    char_boxes = get_vin_char_boxes(vin_line)
+    vin_roi = estimate_vin_roi_by_projection(draw_img, vin_line)
 
-    mask = np.zeros(
-        draw_img.shape[:2],
-        dtype=np.uint8
-    )
+    x1, y1, x2, y2 = vin_roi
 
-    for x1,y1,x2,y2 in char_boxes:
+    if x2 <= x1 or y2 <= y1:
+        return draw_img
 
-        cv2.rectangle(
-            mask,
-            (x1-2,y1-2),
-            (x2+2,y2+2),
-            255,
-            -1
-        )
+    local_mask = build_vin_print_mask(draw_img, vin_roi)
 
-    mask = cv2.GaussianBlur(mask,(5,5),0)
+    full_mask = np.zeros(draw_img.shape[:2], dtype=np.uint8)
+    full_mask[y1:y2, x1:x2] = local_mask
 
-    result = cv2.inpaint(
-        draw_img,
-        mask,
-        3,
-        cv2.INPAINT_TELEA
-    )
+    # remove only VIN print strokes
+    result = cv2.inpaint(draw_img, full_mask, 3, cv2.INPAINT_TELEA)
 
     return result
 
